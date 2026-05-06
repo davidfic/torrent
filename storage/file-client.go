@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"path/filepath"
@@ -14,6 +15,9 @@ import (
 // File-based storage for torrents, that isn't yet bound to a particular torrent.
 type fileClientImpl struct {
 	opts NewFileClientOpts
+	// Shared across all torrents from this client. Nil if disabled, or for
+	// backends that don't use it (mmap).
+	fdCache *fdCache
 }
 
 // All Torrent data stored in this baseDir. The info names of each torrent are used as directories.
@@ -31,6 +35,10 @@ type NewFileClientOpts struct {
 	PieceCompletion PieceCompletion
 	UsePartFiles    g.Option[bool]
 	Logger          *slog.Logger
+	// FdCacheSize bounds the file descriptors the classic backend keeps
+	// open. Zero is the default (~min(1024, RLIMIT_NOFILE/4)); negative
+	// disables caching. No effect with the mmap backend.
+	FdCacheSize int
 }
 
 // The specific part-files option or the default.
@@ -62,11 +70,23 @@ func NewFileOpts(opts NewFileClientOpts) ClientImplCloser {
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
 	}
-	return &fileClientImpl{opts}
+	c := &fileClientImpl{opts: opts}
+	if opts.FdCacheSize >= 0 {
+		size := opts.FdCacheSize
+		if size == 0 {
+			size = defaultFdCacheSize()
+		}
+		c.fdCache = newFdCache(size)
+	}
+	return c
 }
 
 func (me *fileClientImpl) Close() error {
-	return me.opts.PieceCompletion.Close()
+	var cacheErr error
+	if me.fdCache != nil {
+		cacheErr = me.fdCache.close()
+	}
+	return errors.Join(cacheErr, me.opts.PieceCompletion.Close())
 }
 
 func (fs *fileClientImpl) OpenTorrent(
@@ -102,7 +122,7 @@ func (fs *fileClientImpl) OpenTorrent(
 		metainfoFileInfos,
 		info.FileSegmentsIndex(),
 		infoHash,
-		defaultFileIo(),
+		defaultFileIo(fs.fdCache),
 		fs,
 	}
 	if t.partFiles() {

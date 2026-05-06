@@ -17,8 +17,9 @@ type fileReader interface {
 }
 
 // This gets clobbered by a hybrid mmap implementation if mmap is available.
-var defaultFileIo = func() fileIo {
-	return classicFileIo{}
+// The cache is only used by the classic backend.
+var defaultFileIo = func(cache *fdCache) fileIo {
+	return classicFileIo{cache: cache}
 }
 
 type fileIo interface {
