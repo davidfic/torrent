@@ -219,6 +219,19 @@ type ClientConfig struct {
 
 	PieceHashersPerTorrent int // default: 2
 
+	// DiskWorkers is the number of goroutines that perform chunk writes. The
+	// default (zero) is runtime.NumCPU(); negative disables the pool and
+	// falls back to inline synchronous writes on the peer goroutine.
+	//
+	// On HDD-backed storage where seek thrash hurts more than parallelism
+	// helps, set this to 1.
+	DiskWorkers int
+
+	// DiskWriteQueueDepth caps the number of in-flight chunk writes the
+	// pool will accept before Submit blocks. The default (zero) is 256.
+	// Memory cost: roughly DiskWriteQueueDepth * chunk size per Client.
+	DiskWriteQueueDepth int
+
 	// Enable BEP-14 Local Service Discovery by setting this. A nil value
 	// leaves LPD disabled.
 	LocalServiceDiscovery *LocalServiceDiscoveryConfig

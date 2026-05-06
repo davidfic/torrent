@@ -977,8 +977,12 @@ func (c *PeerConn) mainReadLoop() (err error) {
 		case pp.Piece:
 			c.doChunkReadStats(int64(len(msg.Piece)))
 			err = c.receiveChunk(&msg)
-			t.putChunkBuffer(msg.Piece)
-			msg.Piece = nil
+			// receiveChunk clears msg.Piece if it transferred ownership of
+			// the buffer to the disk pool.
+			if msg.Piece != nil {
+				t.putChunkBuffer(msg.Piece)
+				msg.Piece = nil
+			}
 			if err != nil {
 				err = fmt.Errorf("receiving chunk: %w", err)
 			}
