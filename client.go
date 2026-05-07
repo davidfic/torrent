@@ -1540,6 +1540,9 @@ func (cl *Client) newTorrentOpt(opts AddTorrentOpts) (t *Torrent) {
 	if ccfg := cl.config.ChokerConfig; ccfg != nil {
 		go t.runChoker(ccfg)
 	}
+	if to := cl.config.SnubTimeout; to > 0 {
+		go t.runSnubChecker(to)
+	}
 	cl.torrents[t] = struct{}{}
 	return
 }

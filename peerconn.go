@@ -1591,6 +1591,9 @@ func (me *PeerConn) peerPtr() *Peer {
 
 // The actual value to use as the maximum outbound requests.
 func (cn *PeerConn) nominalMaxRequests() maxRequests {
+	if cn.snubbed {
+		return 1
+	}
 	ceiling := maxRequests(maxLocalToRemoteRequests)
 	if cn.t.cl.config.AdaptivePipelining {
 		minDepth := cn.t.cl.config.MinPipelineDepth

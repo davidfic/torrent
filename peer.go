@@ -102,6 +102,11 @@ type (
 		chokerLastBytesRead int64
 		chokerRecentBytes   int64
 		chokerWantsChoked   bool
+
+		// snubbed is set by the snub checker when this peer has outstanding
+		// requests but hasn't delivered a useful chunk in SnubTimeout.
+		// Cleared on the next successful chunk.
+		snubbed bool
 	}
 
 	PeerSource string
@@ -438,6 +443,7 @@ func (c *Peer) receiveChunk(msg *pp.Message) error {
 		f(ReceivedUsefulDataEvent{c, msg})
 	}
 	c.lastUsefulChunkReceived = time.Now()
+	c.clearSnub()
 
 	// Need to record that it hasn't been written yet, before we attempt to do
 	// anything with it.

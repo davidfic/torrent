@@ -254,6 +254,12 @@ type ClientConfig struct {
 	// legacy behaviour (every uploadAllowed peer is unchoked).
 	ChokerConfig *ChokerConfig
 
+	// SnubTimeout marks a peer "snubbed" when it has outstanding requests
+	// but hasn't delivered a useful chunk in this duration. Snubbed peers
+	// drop to one in-flight request and their existing requests are freed
+	// for other peers to claim. Zero disables. Default off.
+	SnubTimeout time.Duration
+
 	// Enable BEP-14 Local Service Discovery by setting this. A nil value
 	// leaves LPD disabled.
 	LocalServiceDiscovery *LocalServiceDiscoveryConfig
