@@ -15,3 +15,8 @@ func seekData(f *os.File, offset int64) (ret int64, err error) {
 func defaultFdCacheSize() int {
 	return 256
 }
+
+// Platforms without RLIMIT_NOFILE: pick something reasonable.
+func defaultMmapStrongCap() int {
+	return 256
+}

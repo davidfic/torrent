@@ -46,3 +46,21 @@ func msync(mm mmap.MMap, offset, nbytes int) error {
 	getDown := offset % pageSize
 	return unix.Msync(mm[offset-getDown:offset+nbytes], unix.MS_SYNC)
 }
+
+// defaultMmapStrongCap reserves at most 1/8 of NOFILE for active mappings.
+// Going past this point doesn't help cache hit rate enough to justify the
+// LRU walk and address-space pressure.
+func defaultMmapStrongCap() int {
+	var lim unix.Rlimit
+	if unix.Getrlimit(unix.RLIMIT_NOFILE, &lim) != nil {
+		return 256
+	}
+	n := int(lim.Cur) / 8
+	if n > 1024 {
+		n = 1024
+	}
+	if n < 16 {
+		n = 16
+	}
+	return n
+}

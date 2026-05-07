@@ -3,16 +3,17 @@
 package storage
 
 import (
+	"container/list"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"os"
 	"sync/atomic"
+	"weak"
 
 	"github.com/anacrolix/sync"
 
-	g "github.com/anacrolix/generics"
 	"github.com/anacrolix/missinggo/v2/panicif"
 	"github.com/edsrzf/mmap-go"
 )
@@ -25,14 +26,14 @@ func init() {
 	s, ok := os.LookupEnv("TORRENT_STORAGE_DEFAULT_FILE_IO")
 	if !ok {
 		defaultFileIo = func(_ *fdCache) fileIo {
-			return &mmapFileIo{}
+			return newMmapFileIo()
 		}
 		return
 	}
 	switch s {
 	case "mmap":
 		defaultFileIo = func(_ *fdCache) fileIo {
-			return &mmapFileIo{}
+			return newMmapFileIo()
 		}
 	case "classic":
 		defaultFileIo = func(cache *fdCache) fileIo {
@@ -43,21 +44,45 @@ func init() {
 	}
 }
 
+// mmapFileIo bounds the number of strongly-referenced file mappings under
+// LRU. When a mapping is demoted off the strong list it's parked in a weak
+// map so a quick re-acquire revives it without remapping. Once the
+// fileMmap loses its last strong reference (cache + consumers all gone),
+// the GC reclaims it via the runtime finalizer that munmaps and closes
+// the fd.
 type mmapFileIo struct {
-	mu sync.RWMutex
-	// We could automatically expire fileMmaps by using weak.Pointers? Currently, the store never
-	// relinquishes its extra ref so we never clean up anyway.
-	paths  map[string]*fileMmap
+	mu     sync.Mutex
+	cap    int
+	strong map[string]*list.Element // *lruEntry
+	lru    *list.List
+	soft   map[string]weak.Pointer[fileMmap]
 	closed bool
+}
+
+type lruEntry struct {
+	name string
+	fm   *fileMmap
+}
+
+func newMmapFileIo() *mmapFileIo {
+	return &mmapFileIo{
+		cap:    defaultMmapStrongCap(),
+		strong: make(map[string]*list.Element),
+		lru:    list.New(),
+		soft:   make(map[string]weak.Pointer[fileMmap]),
+	}
 }
 
 func (me *mmapFileIo) Close() error {
 	me.mu.Lock()
 	defer me.mu.Unlock()
-	for name := range me.paths {
-		me.closeName(name)
+	for _, elem := range me.strong {
+		ent := elem.Value.(*lruEntry)
+		ent.fm.dec() // drop store's ref; consumers, if any, still hold theirs
 	}
-	me.paths = nil
+	me.strong = nil
+	me.lru = nil
+	me.soft = nil
 	me.closed = true
 	return nil
 }
@@ -69,44 +94,88 @@ func (me *mmapFileIo) closedErr() error {
 	return nil
 }
 
-func (me *mmapFileIo) rename(from, to string) (err error) {
+// rename invalidates cache entries for both names. Existing consumers keep
+// their mappings (their fm.refs > 0); future acquires re-open against the
+// new path layout.
+func (me *mmapFileIo) rename(from, to string) error {
 	me.mu.Lock()
 	defer me.mu.Unlock()
-	me.closeName(from)
-	me.closeName(to)
+	me.invalidateLocked(from)
+	me.invalidateLocked(to)
 	return os.Rename(from, to)
 }
 
-func (me *mmapFileIo) closeName(name string) {
-	v, ok := me.paths[name]
-	if ok {
-		// We're forcibly closing the handle. Leave the store's ref intact so we're the only one
-		// that closes it, then delete it anyway. We must be holding the IO context lock to be doing
-		// this if we're not using operation locks.
-		panicif.Err(v.close())
-		g.MustDelete(me.paths, name)
+func (me *mmapFileIo) invalidateLocked(name string) {
+	if elem, ok := me.strong[name]; ok {
+		ent := elem.Value.(*lruEntry)
+		me.lru.Remove(elem)
+		delete(me.strong, name)
+		ent.fm.dec()
 	}
+	delete(me.soft, name)
 }
 
 func (me *mmapFileIo) flush(name string, offset, nbytes int64) error {
-	// Since we are only flushing writes that we created, and we don't currently unmap files after
-	// we've opened them, then if the mmap doesn't exist yet then there's nothing to flush.
-	me.mu.RLock()
-	defer me.mu.RUnlock()
-	v, ok := me.paths[name]
-	if !ok {
+	me.mu.Lock()
+	v, ok := me.lookupLocked(name)
+	me.mu.Unlock()
+	if !ok || !v.writable {
 		return nil
 	}
-	if !v.writable {
-		return nil
-	}
-	// Darwin doesn't have sync for file-offsets?!
+	defer v.dec()
 	return msync(v.m, int(offset), int(nbytes))
+}
+
+// lookupLocked returns a strongly-referenced fileMmap for name if cached.
+// Bumps LRU on a strong hit and promotes from the soft map on a soft hit.
+// The returned fm has had its refcount incremented; the caller must dec()
+// it.
+func (me *mmapFileIo) lookupLocked(name string) (*fileMmap, bool) {
+	if elem, ok := me.strong[name]; ok {
+		ent := elem.Value.(*lruEntry)
+		me.lru.MoveToFront(elem)
+		ent.fm.inc()
+		return ent.fm, true
+	}
+	if wp, ok := me.soft[name]; ok {
+		fm := wp.Value()
+		if fm != nil && fm.tryAcquire() {
+			me.initLocked()
+			me.promoteLocked(name, fm)
+			return fm, true
+		}
+		delete(me.soft, name)
+	}
+	return nil, false
+}
+
+func (me *mmapFileIo) promoteLocked(name string, fm *fileMmap) {
+	ent := &lruEntry{name: name, fm: fm}
+	elem := me.lru.PushFront(ent)
+	me.strong[name] = elem
+	delete(me.soft, name)
+	me.evictLocked()
+}
+
+// evictLocked walks the LRU tail, demoting entries until under cap. Demote
+// drops the store's ref; consumers (if any) keep the file alive. Once
+// consumers release, the fm is finalized and its mmap is munmapped.
+func (me *mmapFileIo) evictLocked() {
+	for me.lru.Len() > me.cap {
+		elem := me.lru.Back()
+		if elem == nil {
+			return
+		}
+		ent := elem.Value.(*lruEntry)
+		me.lru.Remove(elem)
+		delete(me.strong, ent.name)
+		me.soft[ent.name] = weak.Make(ent.fm)
+		ent.fm.dec()
+	}
 }
 
 // Shared file access.
 type fileMmap struct {
-	// Read lock held for each handle. Write lock taken for destructive action like close.
 	mu       sync.RWMutex
 	m        mmap.MMap
 	f        *os.File
@@ -123,10 +192,6 @@ func (me *fileMmap) dec() error {
 }
 
 func (me *fileMmap) close() (err error) {
-	// I can't see any way to avoid this. We need to forcibly alter the actual state of the handle
-	// underneath other consumers to kick them off. Additionally, we need to exclude users of its raw
-	// file descriptor. This is a potential deadlock zone if handles have lifetimes that escape the
-	// file storage implementation (like with NewReader, which don't provide for it).
 	me.mu.Lock()
 	defer me.mu.Unlock()
 	if me.closed {
@@ -140,66 +205,72 @@ func (me *fileMmap) inc() {
 	panicif.LessThanOrEqual(me.refs.Add(1), 0)
 }
 
-func (me *mmapFileIo) openForSharedRead(name string) (_ sharableReader, err error) {
+// tryAcquire increments refs only if the fm hasn't been closed. Used when
+// reviving from the soft map: a weak.Pointer can resolve to an fm whose
+// refs hit 0 and is in the process of being closed; we must reject those.
+func (me *fileMmap) tryAcquire() bool {
+	for {
+		cur := me.refs.Load()
+		if cur == 0 {
+			return false
+		}
+		if me.refs.CompareAndSwap(cur, cur+1) {
+			return true
+		}
+	}
+}
+
+func (me *mmapFileIo) openForSharedRead(name string) (sharableReader, error) {
 	return me.openReadOnly(name)
 }
 
-func (me *mmapFileIo) openForRead(name string) (_ fileReader, err error) {
+func (me *mmapFileIo) openForRead(name string) (fileReader, error) {
 	sh, err := me.openReadOnly(name)
 	if err != nil {
-		return
+		return nil, err
 	}
-	return &mmapFileHandle{
-		shared: sh,
-	}, nil
+	return &mmapFileHandle{shared: sh}, nil
 }
 
-func (me *mmapFileIo) openReadOnly(name string) (_ *mmapSharedFileHandle, err error) {
+func (me *mmapFileIo) openReadOnly(name string) (*mmapSharedFileHandle, error) {
 	me.mu.Lock()
 	defer me.mu.Unlock()
-	err = me.closedErr()
-	if err != nil {
-		return
+	if err := me.closedErr(); err != nil {
+		return nil, err
 	}
-	v, ok := me.paths[name]
-	if ok {
-		return newMmapFile(v), nil
+	if fm, ok := me.lookupLocked(name); ok {
+		return newSharedHandle(fm), nil
 	}
 	f, err := os.Open(name)
 	if err != nil {
-		return
+		return nil, err
 	}
 	mm, err := mmap.Map(f, mmap.RDONLY, 0)
 	if err != nil {
 		f.Close()
-		err = fmt.Errorf("mapping file: %w", err)
-		return
+		return nil, fmt.Errorf("mapping file: %w", err)
 	}
-	v = me.addNewMmap(name, mm, false, f)
-	return newMmapFile(v), nil
+	fm := me.insertLocked(name, mm, false, f)
+	return newSharedHandle(fm), nil
 }
 
-func (me *mmapFileIo) openForWrite(name string, size int64) (_ fileWriter, err error) {
+func (me *mmapFileIo) openForWrite(name string, size int64) (fileWriter, error) {
 	me.mu.Lock()
 	defer me.mu.Unlock()
-	err = me.closedErr()
-	if err != nil {
-		return
+	if err := me.closedErr(); err != nil {
+		return nil, err
 	}
-	v, ok := me.paths[name]
-	if ok {
-		if int64(len(v.m)) == size && v.writable {
-			return newMmapFile(v), nil
-		} else {
-			// Drop the cache ref. We aren't presuming to require it to be closed here, hmm...
-			v.dec()
-			g.MustDelete(me.paths, name)
+	if fm, ok := me.lookupLocked(name); ok {
+		if int64(len(fm.m)) == size && fm.writable {
+			return newSharedHandle(fm), nil
 		}
+		// Wrong size or read-only mapping; replace.
+		me.invalidateLocked(name)
+		fm.dec() // drop the inc from lookupLocked
 	}
-	// TODO: A bunch of this can be done without holding the lock.
 	f, err := openFileExtra(name, os.O_RDWR)
 	if err != nil {
-		return
+		return nil, err
 	}
 	closeFile := true
 	defer func() {
@@ -207,54 +278,68 @@ func (me *mmapFileIo) openForWrite(name string, size int64) (_ fileWriter, err e
 			f.Close()
 		}
 	}()
-	err = f.Truncate(size)
-	if err != nil {
-		err = fmt.Errorf("error truncating file: %w", err)
-		return
+	if err := f.Truncate(size); err != nil {
+		return nil, fmt.Errorf("error truncating file: %w", err)
 	}
 	mm, err := mmap.Map(f, mmap.RDWR, 0)
 	if err != nil {
-		return
+		return nil, err
 	}
-	// This can happen due to filesystem changes outside our control. Don't be naive.
 	if int64(len(mm)) != size {
-		err = fmt.Errorf("new mmap has wrong size %v, expected %v", len(mm), size)
 		mm.Unmap()
-		return
+		return nil, fmt.Errorf("new mmap has wrong size %v, expected %v", len(mm), size)
 	}
 	closeFile = false
-	return newMmapFile(me.addNewMmap(name, mm, true, f)), nil
+	fm := me.insertLocked(name, mm, true, f)
+	return newSharedHandle(fm), nil
 }
 
-func newMmapFile(f *fileMmap) *mmapSharedFileHandle {
-	if !lockHandleOperations {
-		// This can't fail because we have to be holding the IO context lock to be here.
-		panicif.False(f.mu.TryRLock())
+// insertLocked installs a freshly-opened mapping into the cache and returns
+// it with refcount = 2 (one for the cache, one for the caller).
+func (me *mmapFileIo) insertLocked(name string, mm mmap.MMap, writable bool, f *os.File) *fileMmap {
+	me.initLocked()
+	fm := &fileMmap{m: mm, f: f, writable: writable}
+	fm.refs.Store(1) // cache's ref
+	ent := &lruEntry{name: name, fm: fm}
+	elem := me.lru.PushFront(ent)
+	me.strong[name] = elem
+	delete(me.soft, name)
+	me.evictLocked()
+	fm.inc() // caller's ref
+	return fm
+}
+
+// initLocked lazily initialises the cache so a zero-value mmapFileIo is
+// usable without going through the constructor.
+func (me *mmapFileIo) initLocked() {
+	if me.cap == 0 {
+		me.cap = defaultMmapStrongCap()
 	}
-	ret := &mmapSharedFileHandle{
-		f: f,
+	if me.strong == nil {
+		me.strong = make(map[string]*list.Element)
+	}
+	if me.lru == nil {
+		me.lru = list.New()
+	}
+	if me.soft == nil {
+		me.soft = make(map[string]weak.Pointer[fileMmap])
+	}
+}
+
+func newSharedHandle(fm *fileMmap) *mmapSharedFileHandle {
+	if !lockHandleOperations {
+		// We're holding the IO context lock so this can't fail.
+		panicif.False(fm.mu.TryRLock())
+	}
+	return &mmapSharedFileHandle{
+		f: fm,
 		close: sync.OnceValue[error](func() error {
 			if !lockHandleOperations {
-				f.mu.RUnlock()
+				fm.mu.RUnlock()
 			}
-			return f.dec()
+			return fm.dec()
 		}),
 	}
-	ret.f.inc()
-	return ret
-}
-
-func (me *mmapFileIo) addNewMmap(name string, mm mmap.MMap, writable bool, f *os.File) *fileMmap {
-	v := &fileMmap{
-		m:        mm,
-		f:        f,
-		writable: writable,
-	}
-	// One for the store, one for the caller.
-	v.refs.Store(1)
-	g.MakeMapIfNil(&me.paths)
-	g.MapMustAssignNew(me.paths, name, v)
-	return v
 }
 
 var _ fileIo = (*mmapFileIo)(nil)
@@ -265,8 +350,7 @@ type mmapSharedFileHandle struct {
 }
 
 func (me *mmapSharedFileHandle) WriteAt(p []byte, off int64) (n int, err error) {
-	// It's not actually worth the hassle to write using mmap here since the caller provided the
-	// buffer already.
+	// The caller already has the buffer; mmap wouldn't help.
 	return me.f.f.WriteAt(p, off)
 }
 
@@ -306,12 +390,11 @@ func (me *mmapFileHandle) WriteTo(w io.Writer) (n int64, err error) {
 
 func (me *mmapFileHandle) writeToN(w io.Writer, n int64) (written int64, err error) {
 	mu := &me.shared.f.mu
-	// If this panics we need a close error.
 	if lockHandleOperations {
 		mu.RLock()
 	}
 	b := me.shared.f.m
-	panicif.Nil(b) // It's been closed and we need to signal that.
+	panicif.Nil(b)
 	if me.pos >= int64(len(b)) {
 		return
 	}
@@ -344,13 +427,6 @@ func (me *mmapFileHandle) Read(p []byte) (n int, err error) {
 }
 
 func (me *mmapFileHandle) seekDataOrEof(offset int64) (ret int64, err error) {
-	// This should be fine as it's an atomic operation, on a shared file handle, so nobody will be
-	// relying non-atomic operations on the file. TODO: Does this require msync first so we don't
-	// skip our own writes.
-
-	//  We do need to protect the file descriptor as that's not synchronized outside os.File. If
-	//  it's already closed before we call this, that's fine, we'll get EBADF. Don't recursively
-	//  RLock here if we're RLocking at the reference level.
 	mu := &me.shared.f.mu
 	if lockHandleOperations {
 		mu.RLock()
