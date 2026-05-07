@@ -1566,7 +1566,21 @@ func (me *PeerConn) peerPtr() *Peer {
 
 // The actual value to use as the maximum outbound requests.
 func (cn *PeerConn) nominalMaxRequests() maxRequests {
-	return max(1, min(cn.PeerMaxRequests, cn.peakRequests*2, maxLocalToRemoteRequests))
+	ceiling := maxRequests(maxLocalToRemoteRequests)
+	if cn.t.cl.config.AdaptivePipelining {
+		minDepth := cn.t.cl.config.MinPipelineDepth
+		if minDepth <= 0 {
+			minDepth = 4
+		}
+		maxDepth := cn.t.cl.config.MaxPipelineDepth
+		if maxDepth <= 0 {
+			maxDepth = maxLocalToRemoteRequests
+		}
+		if c, ok := cn.adaptiveRequestCeiling(minDepth, maxDepth); ok {
+			ceiling = maxRequests(c)
+		}
+	}
+	return max(1, min(cn.PeerMaxRequests, cn.peakRequests*2, ceiling))
 }
 
 // Set the Peer loggers. This is given Client loggers, and later Torrent loggers when the Torrent is
@@ -1905,6 +1919,10 @@ func (c *PeerConn) checkReceivedChunk(req RequestIndex, msg *pp.Message, ppReq R
 			for _, f := range c.callbacks.ReceivedRequested {
 				f(PeerMessageEvent{c.peerPtr(), msg})
 			}
+		}
+		// Capture RTT before deleteRequest clears the requestState entry.
+		if rs, ok := c.t.requestState[req]; ok {
+			c.updateRttEstimate(time.Since(rs.when))
 		}
 		// Request has been satisfied.
 		if c.deleteRequest(req) || c.requestState.Cancelled.CheckedRemove(req) {
