@@ -93,6 +93,11 @@ type Torrent struct {
 	closedCtxCancel context.CancelCauseFunc
 	onClose         []func()
 
+	// Posted to by disk pool workers when chunk writes finish. Drained by
+	// runWriteCompletions, which runs the post-write bookkeeping under
+	// cl.lock. Nil when the disk pool is disabled.
+	writeCompletions chan writeCompletion
+
 	infoHash   g.Option[metainfo.Hash]
 	infoHashV2 g.Option[infohash_v2.T]
 
@@ -1184,6 +1189,101 @@ func (t *Torrent) writeChunk(piece int, begin int64, data []byte) (err error) {
 		err = io.ErrShortWrite
 	}
 	return err
+}
+
+// writeCompletion carries the result of an asynchronous chunk write back to
+// the receive path's owning Torrent.
+type writeCompletion struct {
+	peer   *Peer
+	piece  pieceIndex
+	req    RequestIndex
+	buffer []byte
+	err    error
+}
+
+// submitChunkWrite sends a chunk write to the client's disk pool. The buffer
+// ownership transfers to the pool: it's returned to the chunk pool after the
+// completion is processed (or on torrent close). Returns false if the pool
+// refused submission, in which case the caller still owns the buffer.
+func (t *Torrent) submitChunkWrite(c *Peer, req RequestIndex, piece pieceIndex, begin int64, buf []byte) bool {
+	wc := writeCompletion{
+		peer:   c,
+		piece:  piece,
+		req:    req,
+		buffer: buf,
+	}
+	return t.cl.diskPool.Submit(t.closedCtx, func() {
+		concurrentChunkWrites.Add(1)
+		n, err := t.piece(int(piece)).Storage().WriteAt(buf, begin)
+		concurrentChunkWrites.Add(-1)
+		if err == nil && n != len(buf) {
+			err = io.ErrShortWrite
+		}
+		wc.err = err
+		select {
+		case t.writeCompletions <- wc:
+		case <-t.closed.Done():
+			t.putChunkBuffer(buf)
+		}
+	})
+}
+
+// runWriteCompletions drains writeCompletions, batching whatever's already
+// available so a single cl.lock acquisition handles a burst of completions.
+func (t *Torrent) runWriteCompletions() {
+	var batch []writeCompletion
+	for {
+		select {
+		case wc := <-t.writeCompletions:
+			batch = append(batch[:0], wc)
+		drain:
+			for {
+				select {
+				case wc2 := <-t.writeCompletions:
+					batch = append(batch, wc2)
+				default:
+					break drain
+				}
+			}
+			t.cl.lock()
+			for i := range batch {
+				t.handleWriteCompletion(batch[i])
+			}
+			t.cl.unlock()
+			t.cl.event.Broadcast()
+		case <-t.closed.Done():
+			// Workers select on t.closed too, so any further sends will
+			// take the close branch and free the buffer themselves. Drain
+			// what's already buffered.
+			for {
+				select {
+				case wc := <-t.writeCompletions:
+					t.putChunkBuffer(wc.buffer)
+				default:
+					return
+				}
+			}
+		}
+	}
+}
+
+func (t *Torrent) handleWriteCompletion(wc writeCompletion) {
+	piece := t.piece(int(wc.piece))
+	piece.decrementPendingWrites()
+	t.putChunkBuffer(wc.buffer)
+	if wc.err != nil {
+		wc.peer.logger.WithDefaultLevel(log.Error).Printf(
+			"writing received chunk %v: %v", wc.req, wc.err)
+		t.pendRequest(wc.req)
+		wc.peer.onNeedUpdateRequests("Peer.receiveChunk error writing chunk")
+		t.onWriteChunkErr(wc.err)
+		return
+	}
+	wc.peer.onDirtiedPiece(wc.piece)
+	if t.pieceAllDirty(wc.piece) && piece.pendingWrites == 0 {
+		t.queuePieceCheck(wc.piece)
+	}
+	t.deferPublishPieceStateChange(wc.piece)
 }
 
 func (t *Torrent) bitfield() (bf []bool) {

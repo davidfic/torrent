@@ -343,14 +343,15 @@ func (ws *webseedPeer) wantedChunksInDiscardWindow(wr *webseedRequest) bool {
 
 func (ws *webseedPeer) readChunks(wr *webseedRequest) (err error) {
 	t := ws.peer.t
-	buf := t.getChunkBuffer()
-	defer t.putChunkBuffer(buf)
 	msg := pp.Message{
 		Type: pp.Piece,
 	}
 	for {
 		reqSpec := t.requestIndexToRequest(wr.next)
 		chunkLen := reqSpec.Length.Int()
+		// Per-chunk allocation: ownership of buf may transfer to the disk
+		// pool inside receiveChunk, so we can't reuse it across iterations.
+		buf := t.getChunkBuffer()
 		buf = buf[:chunkLen]
 		var n int
 		n, err = io.ReadFull(wr.request.Body, buf)
@@ -365,6 +366,7 @@ func (ws *webseedPeer) readChunks(wr *webseedRequest) (err error) {
 		// We need this early for the convict call.
 		ws.peer.locker().Lock()
 		if err != nil {
+			t.putChunkBuffer(buf)
 			if !wr.cancelled.Load() {
 				var rpe webseed.ReadRequestPartError
 				if errors.As(err, &rpe) {
@@ -401,6 +403,11 @@ func (ws *webseedPeer) readChunks(wr *webseedRequest) (err error) {
 		// webseed requests are triggered, we want to ensure our existing request is up to date.
 		wr.next++
 		err = ws.peer.receiveChunk(&msg)
+		// receiveChunk clears msg.Piece if it transferred ownership.
+		if msg.Piece != nil {
+			t.putChunkBuffer(msg.Piece)
+			msg.Piece = nil
+		}
 		stop := err != nil || wr.next >= wr.end
 		if !stop {
 			if !ws.wantedChunksInDiscardWindow(wr) {

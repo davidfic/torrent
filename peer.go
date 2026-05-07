@@ -405,6 +405,31 @@ func (c *Peer) receiveChunk(msg *pp.Message) error {
 		p.cancel(req)
 	}
 
+	if t.writeCompletions != nil {
+		// recordBlockForSmartBan reads msg.Piece via its closure -- run it
+		// before clearing the field below.
+		recordBlockForSmartBan()
+		buf := msg.Piece
+		begin := int64(msg.Begin)
+		msg.Piece = nil // ownership transfers to the disk pool
+		// Submit may block on a full queue, so drop the lock to let the
+		// completion goroutine drain it.
+		var submitted bool
+		func() {
+			cl.unlock()
+			defer cl.lock()
+			submitted = t.submitChunkWrite(c, req, pieceIndex(ppReq.Index), begin, buf)
+		}()
+		if !submitted {
+			piece.decrementPendingWrites()
+			t.putChunkBuffer(buf)
+			t.pendRequest(req)
+			c.onNeedUpdateRequests("disk pool refused submit")
+			return nil
+		}
+		return nil
+	}
+
 	err = func() error {
 		cl.unlock()
 		defer cl.lock()

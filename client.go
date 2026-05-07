@@ -34,6 +34,7 @@ import (
 	"github.com/anacrolix/missinggo/v2/pproffd"
 	"github.com/anacrolix/sync"
 	"github.com/anacrolix/torrent/internal/amortize"
+	"github.com/anacrolix/torrent/internal/diskpool"
 	"github.com/anacrolix/torrent/internal/extracmp"
 	"github.com/anacrolix/torrent/tracker"
 	"github.com/anacrolix/torrent/webtorrent"
@@ -119,6 +120,10 @@ type Client struct {
 	clientWebseedState
 
 	activePieceHashers int
+
+	// Decouples chunk writes from the peer goroutine. Nil if disabled by
+	// config (DiskWorkers < 0).
+	diskPool *diskpool.Pool
 
 	lpd *lpdServer
 }
@@ -399,6 +404,17 @@ func (cl *Client) init(cfg *ClientConfig) {
 	}
 
 	cl.webseedRequestTimer = time.AfterFunc(webseedRequestUpdateTimerInterval, cl.updateWebseedRequestsTimerFunc)
+
+	if workers := cfg.DiskWorkers; workers >= 0 {
+		if workers == 0 {
+			workers = runtime.NumCPU()
+		}
+		queueDepth := cfg.DiskWriteQueueDepth
+		if queueDepth <= 0 {
+			queueDepth = 256
+		}
+		cl.diskPool = diskpool.New(workers, queueDepth)
+	}
 }
 
 // Creates a new Client. Takes ownership of the ClientConfig. Create another one if you want another
@@ -597,6 +613,11 @@ func (cl *Client) Close() (errs []error) {
 	cl.unlock()
 	cl.event.Broadcast()
 	closeGroup.Wait() // defer is LIFO. We want to Wait() after cl.unlock()
+	// All torrents are closed here, so any pool jobs in flight have been or
+	// will be discarded by their per-torrent t.closed select.
+	if cl.diskPool != nil {
+		cl.diskPool.Close()
+	}
 	return
 }
 
@@ -1502,6 +1523,14 @@ func (cl *Client) newTorrentOpt(opts AddTorrentOpts) (t *Torrent) {
 		opts.ChunkSize = defaultChunkSize
 	}
 	t.setChunkSize(opts.ChunkSize)
+	if cl.diskPool != nil {
+		queueDepth := cl.config.DiskWriteQueueDepth
+		if queueDepth <= 0 {
+			queueDepth = 256
+		}
+		t.writeCompletions = make(chan writeCompletion, queueDepth)
+		go t.runWriteCompletions()
+	}
 	cl.torrents[t] = struct{}{}
 	return
 }
