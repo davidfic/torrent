@@ -115,6 +115,9 @@ type Torrent struct {
 	// normally 16KiB by convention these days.
 	chunkSize pp.Integer
 	chunkPool sync.Pool
+	// Buffers used to stage chunks for upload. Mirrors chunkPool but on the
+	// outbound side; eliminates make([]byte, r.Length) per upload chunk.
+	uploadChunkPool sync.Pool
 	// Total length of the torrent in bytes. Stored because it's not O(1) to
 	// get this from the info dict.
 	_length g.Option[int64]
@@ -339,6 +342,12 @@ func (t *Torrent) KnownSwarm() (ks []PeerInfo) {
 func (t *Torrent) setChunkSize(size pp.Integer) {
 	t.chunkSize = size
 	t.chunkPool = sync.Pool{
+		New: func() interface{} {
+			b := make([]byte, size)
+			return &b
+		},
+	}
+	t.uploadChunkPool = sync.Pool{
 		New: func() interface{} {
 			b := make([]byte, size)
 			return &b
@@ -3873,6 +3882,28 @@ func (t *Torrent) putChunkBuffer(b []byte) {
 	panicif.NotEq(cap(b), t.chunkSize.Int())
 	// Does this allocate? Are we amortizing against the cost of a large buffer?
 	t.chunkPool.Put(&b)
+}
+
+// getUploadChunkBuffer returns a buffer suitable for staging a chunk to
+// send to a peer. n is the actual request length; the returned slice has
+// length n and capacity at least chunkSize.
+func (t *Torrent) getUploadChunkBuffer(n int) []byte {
+	if n > t.chunkSize.Int() {
+		// Oversize requests aren't pool-shaped; allocate fresh.
+		return make([]byte, n)
+	}
+	b := *t.uploadChunkPool.Get().(*[]byte)
+	return b[:n]
+}
+
+// putUploadChunkBuffer returns a buffer obtained from getUploadChunkBuffer.
+// Buffers whose cap doesn't match chunkSize (oversize allocations) are
+// dropped on the floor for the GC.
+func (t *Torrent) putUploadChunkBuffer(b []byte) {
+	if cap(b) != t.chunkSize.Int() {
+		return
+	}
+	t.uploadChunkPool.Put(&b)
 }
 
 func (t *Torrent) withSlogger(base *slog.Logger) *slog.Logger {

@@ -339,7 +339,10 @@ func (cn *PeerConn) choke(msg messageWriter) (more bool) {
 
 func (cn *PeerConn) deleteAllPeerRequests() {
 	clear(cn.unreadPeerRequests)
-	clear(cn.readyPeerRequests)
+	for r, b := range cn.readyPeerRequests {
+		cn.t.putUploadChunkBuffer(b)
+		delete(cn.readyPeerRequests, r)
+	}
 }
 
 func (cn *PeerConn) unchoke(msg func(pp.Message) bool) bool {
@@ -754,6 +757,7 @@ func (me *PeerConn) deleteReadyPeerRequest(r Request) {
 		return
 	}
 	delete(me.readyPeerRequests, r)
+	me.t.putUploadChunkBuffer(v)
 	if len(v) > 0 {
 		me.peerRequestDataAllocDecreased.Broadcast()
 	}
@@ -842,7 +846,7 @@ func (c *PeerConn) readPeerRequestData(r Request) ([]byte, error) {
 	if buf, ok := c.t.storeBufferReadChunk(r); ok {
 		return buf, nil
 	}
-	b := make([]byte, r.Length)
+	b := c.t.getUploadChunkBuffer(int(r.Length))
 	p := c.t.info.Piece(int(r.Index))
 	n, err := c.t.readAt(b, p.Offset()+int64(r.Begin))
 	if n == len(b) {
@@ -854,7 +858,11 @@ func (c *PeerConn) readPeerRequestData(r Request) ([]byte, error) {
 			panic("expected error")
 		}
 	}
-	return b, err
+	if err != nil {
+		c.t.putUploadChunkBuffer(b)
+		return nil, err
+	}
+	return b, nil
 }
 
 func (c *PeerConn) logProtocolBehaviour(level log.Level, format string, arg ...interface{}) {
@@ -1238,14 +1246,21 @@ func (c *PeerConn) tickleWriter() {
 func (c *PeerConn) sendChunk(r Request, msg func(pp.Message) bool) (more bool) {
 	b := g.MapMustGet(c.readyPeerRequests, r)
 	panicif.NotEq(len(b), r.Length.Int())
-	c.deleteReadyPeerRequest(r)
+	delete(c.readyPeerRequests, r)
+	if len(b) > 0 {
+		c.peerRequestDataAllocDecreased.Broadcast()
+	}
 	c.lastChunkSent = time.Now()
-	return msg(pp.Message{
+	more = msg(pp.Message{
 		Type:  pp.Piece,
 		Index: r.Index,
 		Begin: r.Begin,
 		Piece: b,
 	})
+	// msg.WriteTo (inside the writer) copies Piece into the per-conn write
+	// buffer, so b is safe to recycle once msg() returns.
+	c.t.putUploadChunkBuffer(b)
+	return
 }
 
 func (c *PeerConn) setTorrent(t *Torrent) {
