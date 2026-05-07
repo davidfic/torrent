@@ -24,6 +24,24 @@ func seekData(f *os.File, offset int64) (ret int64, err error) {
 
 var pageSize = unix.Getpagesize()
 
+// Reserves 3/4 of NOFILE for other consumers (peers, sockets, the process
+// itself). Capped at 1024 because past that point the LRU walk gets long
+// before eviction quality justifies it.
+func defaultFdCacheSize() int {
+	var lim unix.Rlimit
+	if unix.Getrlimit(unix.RLIMIT_NOFILE, &lim) != nil {
+		return 256
+	}
+	n := int(lim.Cur) / 4
+	if n > 1024 {
+		n = 1024
+	}
+	if n < 16 {
+		n = 16
+	}
+	return n
+}
+
 func msync(mm mmap.MMap, offset, nbytes int) error {
 	getDown := offset % pageSize
 	return unix.Msync(mm[offset-getDown:offset+nbytes], unix.MS_SYNC)

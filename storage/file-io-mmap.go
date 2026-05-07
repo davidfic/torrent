@@ -24,19 +24,19 @@ const lockHandleOperations = false
 func init() {
 	s, ok := os.LookupEnv("TORRENT_STORAGE_DEFAULT_FILE_IO")
 	if !ok {
-		defaultFileIo = func() fileIo {
+		defaultFileIo = func(_ *fdCache) fileIo {
 			return &mmapFileIo{}
 		}
 		return
 	}
 	switch s {
 	case "mmap":
-		defaultFileIo = func() fileIo {
+		defaultFileIo = func(_ *fdCache) fileIo {
 			return &mmapFileIo{}
 		}
 	case "classic":
-		defaultFileIo = func() fileIo {
-			return classicFileIo{}
+		defaultFileIo = func(cache *fdCache) fileIo {
+			return classicFileIo{cache: cache}
 		}
 	default:
 		panic(s)
