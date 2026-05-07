@@ -10,3 +10,8 @@ import (
 func seekData(f *os.File, offset int64) (ret int64, err error) {
 	return f.Seek(offset, io.SeekStart)
 }
+
+// Platforms without RLIMIT_NOFILE: pick something reasonable.
+func defaultMmapStrongCap() int {
+	return 256
+}
