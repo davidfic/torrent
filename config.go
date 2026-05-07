@@ -232,6 +232,12 @@ type ClientConfig struct {
 	// Memory cost: roughly DiskWriteQueueDepth * chunk size per Client.
 	DiskWriteQueueDepth int
 
+	// MaxStoreBufferBytes caps the in-memory cache of recently-received
+	// chunks per torrent. Hash verification and upload reads consult it
+	// before falling back to storage. Zero is the default (64 MiB);
+	// negative disables.
+	MaxStoreBufferBytes int64
+
 	// Enable BEP-14 Local Service Discovery by setting this. A nil value
 	// leaves LPD disabled.
 	LocalServiceDiscovery *LocalServiceDiscoveryConfig

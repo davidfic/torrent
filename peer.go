@@ -392,9 +392,11 @@ func (c *Peer) receiveChunk(msg *pp.Message) error {
 	// Need to record that it hasn't been written yet, before we attempt to do
 	// anything with it.
 	piece.incrementPendingWrites()
+	chunkIdx := chunkIndexFromChunkSpec(ppReq.ChunkSpec, t.chunkSize)
 	// Record that we have the chunk, so we aren't trying to download it while
 	// waiting for it to be written to storage.
-	piece.unpendChunkIndex(chunkIndexFromChunkSpec(ppReq.ChunkSpec, t.chunkSize))
+	piece.unpendChunkIndex(chunkIdx)
+	sbKey := storeBufferKey{pieceIndex(ppReq.Index), chunkIdx}
 
 	// Cancel pending requests for this chunk from *other* peers.
 	if p := t.requestingPeer(req); p != nil {
@@ -411,18 +413,25 @@ func (c *Peer) receiveChunk(msg *pp.Message) error {
 		recordBlockForSmartBan()
 		buf := msg.Piece
 		begin := int64(msg.Begin)
-		msg.Piece = nil // ownership transfers to the disk pool
+		msg.Piece = nil // ownership transfers to the disk pool / store buffer
+		if t.storeBuf != nil {
+			t.storeBuf.put(sbKey, buf)
+		}
 		// Submit may block on a full queue, so drop the lock to let the
 		// completion goroutine drain it.
 		var submitted bool
 		func() {
 			cl.unlock()
 			defer cl.lock()
-			submitted = t.submitChunkWrite(c, req, pieceIndex(ppReq.Index), begin, buf)
+			submitted = t.submitChunkWrite(c, req, pieceIndex(ppReq.Index), chunkIdx, begin, buf)
 		}()
 		if !submitted {
 			piece.decrementPendingWrites()
-			t.putChunkBuffer(buf)
+			if t.storeBuf != nil {
+				t.storeBuf.removeAndFree(sbKey)
+			} else {
+				t.putChunkBuffer(buf)
+			}
 			t.pendRequest(req)
 			c.onNeedUpdateRequests("disk pool refused submit")
 			return nil
@@ -430,6 +439,14 @@ func (c *Peer) receiveChunk(msg *pp.Message) error {
 		return nil
 	}
 
+	syncBuf := msg.Piece
+	if t.storeBuf != nil {
+		// recordBlockForSmartBan reads msg.Piece via its closure, so capture
+		// the hash before we clear the field for ownership transfer.
+		recordBlockForSmartBan()
+		t.storeBuf.put(sbKey, syncBuf)
+		msg.Piece = nil // cache owns now; peerconn won't free
+	}
 	err = func() error {
 		cl.unlock()
 		defer cl.lock()
@@ -442,12 +459,15 @@ func (c *Peer) receiveChunk(msg *pp.Message) error {
 		// because we want to handle errors synchronously and I haven't thought of a nice way to
 		// defer any concurrency to the storage and have that notify the client of errors. TODO: Do
 		// that instead.
-		return t.writeChunk(int(msg.Index), int64(msg.Begin), msg.Piece)
+		return t.writeChunk(int(ppReq.Index), int64(msg.Begin), syncBuf)
 	}()
 
 	piece.decrementPendingWrites()
 
 	if err != nil {
+		if t.storeBuf != nil {
+			t.storeBuf.removeAndFree(sbKey)
+		}
 		c.logger.WithDefaultLevel(log.Error).Printf("writing received chunk %v: %v", req, err)
 		t.pendRequest(req)
 		// Necessary to pass TestReceiveChunkStorageFailureSeederFastExtensionDisabled. I think a
@@ -456,6 +476,9 @@ func (c *Peer) receiveChunk(msg *pp.Message) error {
 		c.onNeedUpdateRequests("Peer.receiveChunk error writing chunk")
 		t.onWriteChunkErr(err)
 		return nil
+	}
+	if t.storeBuf != nil {
+		t.storeBuf.markPersisted(sbKey)
 	}
 
 	c.onDirtiedPiece(pieceIndex(ppReq.Index))
