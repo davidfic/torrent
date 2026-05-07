@@ -1523,6 +1523,12 @@ func (cl *Client) newTorrentOpt(opts AddTorrentOpts) (t *Torrent) {
 		opts.ChunkSize = defaultChunkSize
 	}
 	t.setChunkSize(opts.ChunkSize)
+	if max := cl.config.MaxStoreBufferBytes; max >= 0 {
+		if max == 0 {
+			max = 64 << 20
+		}
+		t.storeBuf = newStoreBuffer(t, max)
+	}
 	if cl.diskPool != nil {
 		queueDepth := cl.config.DiskWriteQueueDepth
 		if queueDepth <= 0 {

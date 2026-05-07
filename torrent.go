@@ -98,6 +98,10 @@ type Torrent struct {
 	// cl.lock. Nil when the disk pool is disabled.
 	writeCompletions chan writeCompletion
 
+	// In-memory chunk cache for hashing and upload reads. Nil when
+	// MaxStoreBufferBytes is non-positive.
+	storeBuf *storeBuffer
+
 	infoHash   g.Option[metainfo.Hash]
 	infoHashV2 g.Option[infohash_v2.T]
 
@@ -1136,6 +1140,9 @@ func (t *Torrent) close(wg *sync.WaitGroup) {
 	t.iterPeers(func(p *Peer) {
 		p.close()
 	})
+	if t.storeBuf != nil {
+		t.storeBuf.close()
+	}
 	if t.storage != nil {
 		t.deletePieceRequestOrder()
 	}
@@ -1196,21 +1203,25 @@ func (t *Torrent) writeChunk(piece int, begin int64, data []byte) (err error) {
 type writeCompletion struct {
 	peer   *Peer
 	piece  pieceIndex
+	chunk  chunkIndexType
 	req    RequestIndex
-	buffer []byte
+	buffer []byte // nil when storeBuf owns the buffer
 	err    error
 }
 
 // submitChunkWrite sends a chunk write to the client's disk pool. The buffer
-// ownership transfers to the pool: it's returned to the chunk pool after the
-// completion is processed (or on torrent close). Returns false if the pool
-// refused submission, in which case the caller still owns the buffer.
-func (t *Torrent) submitChunkWrite(c *Peer, req RequestIndex, piece pieceIndex, begin int64, buf []byte) bool {
+// ownership transfers to the pool (or to storeBuf if enabled). Returns false
+// if the pool refused submission, in which case the caller still owns the
+// buffer.
+func (t *Torrent) submitChunkWrite(c *Peer, req RequestIndex, piece pieceIndex, chunk chunkIndexType, begin int64, buf []byte) bool {
 	wc := writeCompletion{
-		peer:   c,
-		piece:  piece,
-		req:    req,
-		buffer: buf,
+		peer:  c,
+		piece: piece,
+		chunk: chunk,
+		req:   req,
+	}
+	if t.storeBuf == nil {
+		wc.buffer = buf
 	}
 	return t.cl.diskPool.Submit(t.closedCtx, func() {
 		concurrentChunkWrites.Add(1)
@@ -1223,7 +1234,10 @@ func (t *Torrent) submitChunkWrite(c *Peer, req RequestIndex, piece pieceIndex, 
 		select {
 		case t.writeCompletions <- wc:
 		case <-t.closed.Done():
-			t.putChunkBuffer(buf)
+			if t.storeBuf == nil {
+				t.putChunkBuffer(buf)
+			}
+			// else: storeBuf.close() will drain unpinned entries.
 		}
 	})
 }
@@ -1258,7 +1272,9 @@ func (t *Torrent) runWriteCompletions() {
 			for {
 				select {
 				case wc := <-t.writeCompletions:
-					t.putChunkBuffer(wc.buffer)
+					if t.storeBuf == nil {
+						t.putChunkBuffer(wc.buffer)
+					}
 				default:
 					return
 				}
@@ -1270,14 +1286,24 @@ func (t *Torrent) runWriteCompletions() {
 func (t *Torrent) handleWriteCompletion(wc writeCompletion) {
 	piece := t.piece(int(wc.piece))
 	piece.decrementPendingWrites()
-	t.putChunkBuffer(wc.buffer)
+	key := storeBufferKey{wc.piece, wc.chunk}
 	if wc.err != nil {
+		if t.storeBuf != nil {
+			t.storeBuf.removeAndFree(key)
+		} else {
+			t.putChunkBuffer(wc.buffer)
+		}
 		wc.peer.logger.WithDefaultLevel(log.Error).Printf(
 			"writing received chunk %v: %v", wc.req, wc.err)
 		t.pendRequest(wc.req)
 		wc.peer.onNeedUpdateRequests("Peer.receiveChunk error writing chunk")
 		t.onWriteChunkErr(wc.err)
 		return
+	}
+	if t.storeBuf != nil {
+		t.storeBuf.markPersisted(key)
+	} else {
+		t.putChunkBuffer(wc.buffer)
 	}
 	wc.peer.onDirtiedPiece(wc.piece)
 	if t.pieceAllDirty(wc.piece) && piece.pendingWrites == 0 {
@@ -1452,8 +1478,60 @@ func (t *Torrent) hashPieceWithSpecificHash(piece pieceIndex, h hash.Hash) (
 	p := t.piece(piece)
 	storagePiece := p.Storage()
 	var written int64
-	written, err = storagePiece.WriteTo(w)
+	if t.storeBuf != nil {
+		written, err = t.hashPieceFromStoreBuffer(piece, w)
+	} else {
+		written, err = storagePiece.WriteTo(w)
+	}
 	t.countBytesHashed(written)
+	return
+}
+
+// hashPieceFromStoreBuffer walks the piece chunk by chunk, serving from the
+// store buffer where possible and falling back to storage ReadAt on a miss.
+// The smart-ban writer composed into w handles chunk-aligned writes
+// transparently.
+func (t *Torrent) hashPieceFromStoreBuffer(piece pieceIndex, w io.Writer) (written int64, err error) {
+	p := t.piece(piece)
+	storagePiece := p.Storage()
+	pieceLen := int64(p.length())
+	chunkSize := int64(t.chunkSize)
+	numChunks := t.pieceNumChunks(piece)
+	var scratch []byte
+	for i := chunkIndexType(0); i < numChunks; i++ {
+		offset := int64(i) * chunkSize
+		chunkLen := chunkSize
+		if pieceLen-offset < chunkLen {
+			chunkLen = pieceLen - offset
+		}
+		key := storeBufferKey{piece, i}
+		data, ref, hit := t.storeBuf.get(key, true)
+		if !hit {
+			if scratch == nil {
+				scratch = make([]byte, chunkSize)
+			}
+			var n int
+			n, err = storagePiece.ReadAt(scratch[:chunkLen], offset)
+			if err != nil && err != io.EOF {
+				return
+			}
+			err = nil
+			data = scratch[:n]
+		}
+		var n int
+		n, err = w.Write(data)
+		if hit {
+			ref.release()
+		}
+		written += int64(n)
+		if err != nil {
+			return
+		}
+		if !hit && int64(n) < chunkLen {
+			// Short read from storage; piece data is incomplete.
+			return
+		}
+	}
 	return
 }
 

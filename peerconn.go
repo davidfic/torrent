@@ -839,6 +839,9 @@ func (c *PeerConn) useBestReject(r Request) {
 }
 
 func (c *PeerConn) readPeerRequestData(r Request) ([]byte, error) {
+	if buf, ok := c.t.storeBufferReadChunk(r); ok {
+		return buf, nil
+	}
 	b := make([]byte, r.Length)
 	p := c.t.info.Piece(int(r.Index))
 	n, err := c.t.readAt(b, p.Offset()+int64(r.Begin))
