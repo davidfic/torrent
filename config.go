@@ -250,6 +250,10 @@ type ClientConfig struct {
 	MinPipelineDepth int
 	MaxPipelineDepth int
 
+	// ChokerConfig enables the periodic upload-slot choker. Nil keeps the
+	// legacy behaviour (every uploadAllowed peer is unchoked).
+	ChokerConfig *ChokerConfig
+
 	// Enable BEP-14 Local Service Discovery by setting this. A nil value
 	// leaves LPD disabled.
 	LocalServiceDiscovery *LocalServiceDiscoveryConfig

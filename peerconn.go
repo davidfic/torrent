@@ -1175,6 +1175,9 @@ func (c *PeerConn) uploadAllowed() bool {
 	if c.t.dataUploadDisallowed {
 		return false
 	}
+	if c.chokerWantsChoked {
+		return false
+	}
 	if c.t.seeding() {
 		return true
 	}

@@ -93,6 +93,15 @@ type (
 		// Zero until the first chunk arrives. Used by adaptive pipelining to
 		// size the request queue against the bandwidth-delay product.
 		rttEstimate time.Duration
+
+		// Owned by the choker. chokerLastBytesRead snapshots
+		// _stats.BytesReadData at the previous tick; chokerRecentBytes is
+		// the delta computed at the current tick. chokerWantsChoked, when
+		// true, makes uploadAllowed return false so the writer doesn't
+		// undo the choker's decision.
+		chokerLastBytesRead int64
+		chokerRecentBytes   int64
+		chokerWantsChoked   bool
 	}
 
 	PeerSource string

@@ -1537,6 +1537,9 @@ func (cl *Client) newTorrentOpt(opts AddTorrentOpts) (t *Torrent) {
 		t.writeCompletions = make(chan writeCompletion, queueDepth)
 		go t.runWriteCompletions()
 	}
+	if ccfg := cl.config.ChokerConfig; ccfg != nil {
+		go t.runChoker(ccfg)
+	}
 	cl.torrents[t] = struct{}{}
 	return
 }
