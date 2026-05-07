@@ -250,6 +250,7 @@ func (me *mmapFileIo) openReadOnly(name string) (*mmapSharedFileHandle, error) {
 		f.Close()
 		return nil, fmt.Errorf("mapping file: %w", err)
 	}
+	madviseAfterMap(mm)
 	fm := me.insertLocked(name, mm, false, f)
 	return newSharedHandle(fm), nil
 }
@@ -289,6 +290,7 @@ func (me *mmapFileIo) openForWrite(name string, size int64) (fileWriter, error) 
 		mm.Unmap()
 		return nil, fmt.Errorf("new mmap has wrong size %v, expected %v", len(mm), size)
 	}
+	madviseAfterMap(mm)
 	closeFile = false
 	fm := me.insertLocked(name, mm, true, f)
 	return newSharedHandle(fm), nil
