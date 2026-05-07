@@ -1502,6 +1502,9 @@ func (cl *Client) newTorrentOpt(opts AddTorrentOpts) (t *Torrent) {
 		opts.ChunkSize = defaultChunkSize
 	}
 	t.setChunkSize(opts.ChunkSize)
+	if to := cl.config.SnubTimeout; to > 0 {
+		go t.runSnubChecker(to)
+	}
 	cl.torrents[t] = struct{}{}
 	return
 }
