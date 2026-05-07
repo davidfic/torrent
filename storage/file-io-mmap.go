@@ -175,6 +175,7 @@ func (me *mmapFileIo) openReadOnly(name string) (_ *mmapSharedFileHandle, err er
 		err = fmt.Errorf("mapping file: %w", err)
 		return
 	}
+	madviseAfterMap(mm)
 	v = me.addNewMmap(name, mm, false, f)
 	return newMmapFile(v), nil
 }
@@ -222,6 +223,7 @@ func (me *mmapFileIo) openForWrite(name string, size int64) (_ fileWriter, err e
 		mm.Unmap()
 		return
 	}
+	madviseAfterMap(mm)
 	closeFile = false
 	return newMmapFile(me.addNewMmap(name, mm, true, f)), nil
 }
