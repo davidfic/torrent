@@ -1502,6 +1502,9 @@ func (cl *Client) newTorrentOpt(opts AddTorrentOpts) (t *Torrent) {
 		opts.ChunkSize = defaultChunkSize
 	}
 	t.setChunkSize(opts.ChunkSize)
+	if ccfg := cl.config.ChokerConfig; ccfg != nil {
+		go t.runChoker(ccfg)
+	}
 	cl.torrents[t] = struct{}{}
 	return
 }

@@ -88,6 +88,15 @@ type (
 		peerMinPieces pieceIndex
 
 		peerAllowedFast typedRoaring.Bitmap[pieceIndex]
+
+		// Owned by the choker. chokerLastBytesRead snapshots
+		// _stats.BytesReadData at the previous tick; chokerRecentBytes is
+		// the delta computed at the current tick. chokerWantsChoked, when
+		// true, makes uploadAllowed return false so the writer doesn't
+		// undo the choker's decision.
+		chokerLastBytesRead int64
+		chokerRecentBytes   int64
+		chokerWantsChoked   bool
 	}
 
 	PeerSource string
