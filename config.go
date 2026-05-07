@@ -238,6 +238,18 @@ type ClientConfig struct {
 	// negative disables.
 	MaxStoreBufferBytes int64
 
+	// AdaptivePipelining sizes per-peer outstanding requests against the
+	// observed bandwidth-delay product instead of the fixed write-buffer
+	// ceiling. Off by default; turn on for swarms with mixed RTTs where the
+	// fixed ceiling either over-provisions short-haul peers or
+	// under-provisions long-haul ones.
+	AdaptivePipelining bool
+
+	// MinPipelineDepth and MaxPipelineDepth bound the adaptive computation.
+	// Defaults are 4 and the static buffer-derived ceiling.
+	MinPipelineDepth int
+	MaxPipelineDepth int
+
 	// Enable BEP-14 Local Service Discovery by setting this. A nil value
 	// leaves LPD disabled.
 	LocalServiceDiscovery *LocalServiceDiscoveryConfig

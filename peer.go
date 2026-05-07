@@ -88,6 +88,11 @@ type (
 		peerMinPieces pieceIndex
 
 		peerAllowedFast typedRoaring.Bitmap[pieceIndex]
+
+		// EMA of observed (request-sent → chunk-received) round-trip time.
+		// Zero until the first chunk arrives. Used by adaptive pipelining to
+		// size the request queue against the bandwidth-delay product.
+		rttEstimate time.Duration
 	}
 
 	PeerSource string
@@ -190,6 +195,42 @@ func (cn *Peer) downloadRate() float64 {
 		return 0
 	}
 	return float64(num) / cn.totalExpectingTime().Seconds()
+}
+
+// updateRttEstimate folds an observed round-trip into the EMA.
+func (cn *Peer) updateRttEstimate(sample time.Duration) {
+	if sample <= 0 {
+		return
+	}
+	const alpha = 0.125 // standard TCP-style smoothing factor
+	if cn.rttEstimate == 0 {
+		cn.rttEstimate = sample
+		return
+	}
+	cn.rttEstimate = time.Duration(
+		float64(cn.rttEstimate)*(1-alpha) + float64(sample)*alpha,
+	)
+}
+
+// adaptiveRequestCeiling returns a bandwidth-delay-product-based ceiling on
+// in-flight requests. Returns (0, false) when we don't have enough data yet
+// or the feature is disabled; the caller should fall back to the static
+// formula.
+func (cn *Peer) adaptiveRequestCeiling(min, max int) (int, bool) {
+	rate := cn.downloadRate()
+	rtt := cn.rttEstimate
+	if rate <= 0 || rtt <= 0 || cn.t.chunkSize == 0 {
+		return 0, false
+	}
+	bdp := rate * rtt.Seconds()
+	target := int(bdp / float64(cn.t.chunkSize))
+	if target < min {
+		target = min
+	}
+	if target > max {
+		target = max
+	}
+	return target, true
 }
 
 // Deprecated: Use Peer.Stats.
